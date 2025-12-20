@@ -51,22 +51,49 @@ def load_labels(path):
     if not rows:
         return labels
     start = 0
-    if rows[0] and rows[0][0].strip().lower() == "path":
+    header = [cell.strip().lower() for cell in rows[0]]
+    if header and header[0] in {"group_id", "path_1", "path"}:
         start = 1
+        if header[0] == "path" and "group_id" not in header and "path_1" not in header:
+            print(
+                "warn: labels file looks like per-image format; "
+                "please re-label with group labels.",
+                file=sys.stderr,
+            )
+            return labels
     for row in rows[start:]:
         if len(row) < 2:
             continue
-        labels[row[0]] = row[1]
+        group_id = row[0]
+        label = row[1]
+        paths = []
+        if len(row) >= 7:
+            paths = [cell for cell in row[2:7] if cell]
+        labels[group_id] = {"label": label, "paths": paths}
     return labels
 
 
-def save_labels(labels, path):
+def save_labels(labels, path, order=None, group_index=None):
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["path", "label"])
-        for rel_path in sorted(labels.keys(), key=_natural_key):
-            writer.writerow([rel_path, labels[rel_path]])
+        writer.writerow(["group_id", "label", "path_1", "path_2", "path_3", "path_4", "path_5"])
+        if order:
+            group_ids = [group_id for group_id in order if group_id in labels]
+            extra = [group_id for group_id in labels.keys() if group_id not in order]
+            group_ids.extend(sorted(extra, key=_natural_key))
+        else:
+            group_ids = sorted(labels.keys(), key=_natural_key)
+        for group_id in group_ids:
+            entry = labels[group_id]
+            row = [group_id, entry["label"]]
+            paths = list(entry.get("paths") or [])
+            if group_index and not paths:
+                paths = list(group_index.get(group_id, []))
+            if len(paths) < 5:
+                paths.extend([""] * (5 - len(paths)))
+            row.extend(paths[:5])
+            writer.writerow(row)
     os.replace(tmp_path, path)
 
 
@@ -74,13 +101,41 @@ def rel_image_path(abs_path, images_dir):
     return os.path.relpath(abs_path, images_dir)
 
 
-def find_start(sequences, labels, images_dir):
-    for seq_idx, (_, files) in enumerate(sequences):
-        for frame_idx, path in enumerate(files):
-            rel_path = rel_image_path(path, images_dir)
-            if rel_path not in labels:
-                return seq_idx, frame_idx
-    return len(sequences), 0
+def build_group(files, start_idx, gap, num_images):
+    max_offset = gap * (num_images - 1)
+    if start_idx + max_offset >= len(files):
+        return None
+    group = []
+    for i in range(num_images):
+        idx = start_idx + i * gap
+        group.append(files[idx])
+    return group
+
+
+def build_groups(sequences, images_dir, gap, num_images, step):
+    groups = []
+    group_index = {}
+    for seq_idx, (seq_name, files) in enumerate(sequences):
+        max_offset = gap * (num_images - 1)
+        max_start = len(files) - max_offset
+        for start_idx in range(0, max_start, step):
+            group_files = build_group(files, start_idx, gap, num_images)
+            if not group_files:
+                break
+            rel_paths = [rel_image_path(path, images_dir) for path in group_files]
+            group_id = rel_paths[0]
+            group_index[group_id] = rel_paths
+            groups.append(
+                {
+                    "seq_idx": seq_idx,
+                    "seq_name": seq_name,
+                    "start_idx": start_idx,
+                    "files": group_files,
+                    "group_id": group_id,
+                    "rel_paths": rel_paths,
+                }
+            )
+    return groups, group_index
 
 
 def build_panel(image_paths, thumb_height):
@@ -173,6 +228,12 @@ def parse_args():
         help="Frame gap between preview images (default: 5).",
     )
     parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Step between group starts (default: 1).",
+    )
+    parser.add_argument(
         "--thumb-height",
         type=int,
         default=220,
@@ -205,17 +266,29 @@ def main():
         print("error: no images found under images dir", file=sys.stderr)
         return 1
 
-    labels = load_labels(args.labels_file)
-    total_images = sum(len(files) for _, files in sequences)
-
     gap = max(1, args.gap)
     num_images = max(1, args.num_images)
-    segment_len = gap * (num_images - 1) + 1
+    step = max(1, args.step)
 
-    seq_idx, frame_idx = find_start(sequences, labels, images_dir)
-    if seq_idx >= len(sequences):
-        print("all images already labeled.")
-        return 0
+    groups, group_index = build_groups(sequences, images_dir, gap, num_images, step)
+    group_order = [group["group_id"] for group in groups]
+    total_groups = len(groups)
+    if total_groups == 0:
+        print("error: no complete groups found for labeling.", file=sys.stderr)
+        return 1
+
+    labels = load_labels(args.labels_file)
+    if labels:
+        kept = {group_id: entry for group_id, entry in labels.items() if group_id in group_index}
+        if len(kept) != len(labels):
+            print("warn: dropped labels that do not match current grouping.", file=sys.stderr)
+        labels = kept
+
+    first_unlabeled = next(
+        (idx for idx, group in enumerate(groups) if group["group_id"] not in labels),
+        None,
+    )
+    group_pos = first_unlabeled if first_unlabeled is not None else 0
 
     window_name = "Labeler"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -246,47 +319,35 @@ def main():
     last_auto = 0.0
 
     while True:
-        if seq_idx >= len(sequences):
-            done = np.zeros((200, 600, 3), dtype=np.uint8)
-            cv2.putText(
-                done,
-                "All images labeled.",
-                (30, 100),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.imshow(window_name, done)
-            cv2.waitKey(0)
-            break
+        if group_pos < 0:
+            group_pos = 0
+        if group_pos >= total_groups:
+            group_pos = total_groups - 1
 
-        seq_name, files = sequences[seq_idx]
-        segment_end = min(frame_idx + segment_len, len(files))
-        segment_files = files[frame_idx:segment_end]
-
-        preview_files = []
-        for i in range(num_images):
-            idx = frame_idx + i * gap
-            if idx < len(files):
-                preview_files.append(files[idx])
-            else:
-                break
+        group = groups[group_pos]
+        seq_name = group["seq_name"]
+        group_files = group["files"]
+        group_id = group["group_id"]
+        preview_files = list(group_files)
 
         panel = build_panel(preview_files, args.thumb_height)
         if panel is None:
-            frame_idx = segment_end
+            group_pos += 1
             continue
 
         labeled_count = len(labels)
-        progress = 100.0 * labeled_count / float(total_images)
+        progress = 100.0 * labeled_count / float(total_groups)
         auto_state = "ON" if auto_key or state["mouse_auto"] else "OFF"
+        frame_indices = [group["start_idx"] + i * gap + 1 for i in range(len(group_files))]
+        index_text = ",".join(str(idx) for idx in frame_indices)
+        current_label = labels.get(group_id, {}).get("label", "none")
+        all_labeled = "YES" if labeled_count == total_groups else "NO"
         info_lines = [
-            f"Seq: {seq_name} | Segment: {frame_idx + 1}-{segment_end} ({len(segment_files)} frames)",
-            f"Progress: {labeled_count}/{total_images} ({progress:.1f}%) | Auto-normal: {auto_state}",
+            f"Seq: {seq_name} | Group start: {group['start_idx'] + 1} | Frames: {index_text}",
+            f"Progress: {labeled_count}/{total_groups} ({progress:.1f}%) | All labeled: {all_labeled}",
+            f"Label: {current_label} | Auto-normal: {auto_state}",
             "Keys: [N/Space/Enter]=normal  [A]=abnormal  [F]=toggle auto  [Q/Esc]=quit",
-            "Mouse: click=normal  hold=auto-normal",
+            "Nav: [B/Left]=prev  [V/Right]=next | Mouse: click=normal  hold=auto-normal",
         ]
         screen = render_screen(panel, info_lines)
         cv2.imshow(window_name, screen)
@@ -304,6 +365,10 @@ def main():
             state["mouse_click"] = False
         elif key in (ord("q"), ord("Q"), 27):
             break
+        elif key in (ord("b"), ord("B"), ord("["), ord(","), 81):
+            group_pos -= 1
+        elif key in (ord("v"), ord("V"), ord("]"), ord("."), 83):
+            group_pos += 1
         elif key in (ord("f"), ord("F")):
             auto_key = not auto_key
             if auto_key:
@@ -319,15 +384,14 @@ def main():
 
         if action is not None:
             label_value = "normal" if action == "normal" else "abnormal"
-            for path in segment_files:
-                rel_path = rel_image_path(path, images_dir)
-                labels[rel_path] = label_value
-            save_labels(labels, args.labels_file)
+            labels[group_id] = {"label": label_value, "paths": group["rel_paths"]}
+            save_labels(labels, args.labels_file, order=group_order, group_index=group_index)
             last_auto = time.time()
-            frame_idx = segment_end
-            if frame_idx >= len(files):
-                seq_idx += 1
-                frame_idx = 0
+            if group_pos < total_groups - 1:
+                group_pos += 1
+            else:
+                auto_key = False
+                state["mouse_auto"] = False
 
     cv2.destroyAllWindows()
     return 0
