@@ -179,7 +179,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <header>
     <div>
       <h2 class="title">视频异常监测</h2>
-      <div class="subtitle">《机器视觉与图像处理》课程大作业  王弘昊</div>
+      <div class="subtitle">《机器视觉与图像处理》课程大作业  by王弘昊</div>
     </div>
     <div class="pill">实时分析</div>
   </header>
