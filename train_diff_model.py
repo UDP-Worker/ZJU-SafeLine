@@ -18,7 +18,12 @@ def parse_args():
     parser.add_argument("--run-name", default="", help="Run name (default: timestamp).")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint.")
     parser.add_argument("--resume-path", default="", help="Path to checkpoint to resume.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs.")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Number of epochs to run this invocation (additional when resuming).",
+    )
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
@@ -194,6 +199,13 @@ def save_checkpoint(path, epoch, model, optimizer, best_f1, train_idx, val_idx, 
     )
 
 
+def load_torch_checkpoint(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def checkpoint_kind(obj):
     if isinstance(obj, dict) and "model_state" in obj:
         return "full"
@@ -236,7 +248,7 @@ def main():
         if not os.path.isfile(checkpoint_path):
             print(f"error: checkpoint not found: {checkpoint_path}", file=sys.stderr)
             return 1
-        loaded = torch.load(checkpoint_path, map_location="cpu")
+        loaded = load_torch_checkpoint(checkpoint_path)
         kind = checkpoint_kind(loaded)
         if kind == "full":
             checkpoint = loaded
@@ -323,6 +335,7 @@ def main():
 
     best_f1 = -1.0
     start_epoch = 1
+    target_epoch = args.epochs
     best_path = os.path.join(out_dir, "best_model.pt")
     latest_path = os.path.join(out_dir, "latest.pt")
 
@@ -336,12 +349,13 @@ def main():
                     state[key] = value.to(device)
         best_f1 = checkpoint.get("best_f1", best_f1)
         start_epoch = checkpoint.get("epoch", 0) + 1
-        writer.add_text("resume", f"path={checkpoint_path} start_epoch={start_epoch}")
-        if start_epoch > args.epochs:
-            print("error: start epoch exceeds total epochs.", file=sys.stderr)
-            return 1
+        target_epoch = start_epoch + args.epochs - 1
+        writer.add_text(
+            "resume",
+            f"path={checkpoint_path} start_epoch={start_epoch} target_epoch={target_epoch}",
+        )
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, target_epoch + 1):
         model.train()
         running_loss = 0.0
         num_batches = len(train_loader)
@@ -357,7 +371,7 @@ def main():
             if args.log_interval > 0 and (step % args.log_interval == 0 or step == num_batches):
                 avg_loss = running_loss / float(step * args.batch_size)
                 print(
-                    f"epoch {epoch}/{args.epochs} "
+                    f"epoch {epoch}/{target_epoch} "
                     f"step {step}/{num_batches} "
                     f"train_loss={avg_loss:.4f}"
                 )
@@ -388,7 +402,7 @@ def main():
         )
 
         print(
-            f"epoch {epoch}/{args.epochs} "
+            f"epoch {epoch}/{target_epoch} "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_loss:.4f} "
             f"val_f1={val_f1:.4f}"
