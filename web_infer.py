@@ -3,6 +3,7 @@ import cgi
 import io
 import os
 import sys
+import socket
 import threading
 import time
 from collections import deque
@@ -178,8 +179,8 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
   <header>
     <div>
-      <h2 class="title">视频异常监测</h2>
-      <div class="subtitle">《机器视觉与图像处理》课程大作业  by王弘昊</div>
+      <h2 class="title">违规取放监测</h2>
+      <div class="subtitle">《机器视觉与图像处理》课程大作业    by王弘昊</div>
     </div>
     <div class="pill">实时分析</div>
   </header>
@@ -321,7 +322,6 @@ class AppState:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Web UI for real-time video inference.")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind.")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind.")
     parser.add_argument("--model", default="final_model.pt", help="Path to model checkpoint.")
     parser.add_argument("--height", type=int, default=810, help="Target height for padding.")
@@ -329,6 +329,12 @@ def parse_args():
     parser.add_argument("--interval", type=float, default=0.25, help="Frame sampling interval.")
     parser.add_argument("--threshold", type=float, default=0.7, help="Decision threshold.")
     parser.add_argument("--loop", action="store_true", help="Loop video files when finished.")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device for inference (default: auto).",
+    )
     return parser.parse_args()
 
 
@@ -482,12 +488,35 @@ def main():
     if not os.path.isfile(args.model):
         print(f"error: model not found: {args.model}", file=sys.stderr)
         return 1
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device == "cuda":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            print("warn: cuda not available, falling back to cpu.", file=sys.stderr)
+            device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.model, device)
     state = AppState()
     handler = make_handler(state, model, device, args)
-    server = ThreadingHTTPServer((args.host, args.port), handler)
-    print(f"serving on http://{args.host}:{args.port}")
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
+    print(f"inference device: {device}")
+    print(f"local: http://127.0.0.1:{args.port}")
+    lan_ip = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        lan_ip = sock.getsockname()[0]
+        sock.close()
+    except OSError:
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            lan_ip = None
+    if lan_ip and lan_ip != "127.0.0.1":
+        print(f"lan: http://{lan_ip}:{args.port}")
     server.serve_forever()
     return 0
 
