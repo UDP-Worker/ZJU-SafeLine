@@ -320,6 +320,62 @@ class AppState:
             return self.source, self.source_name
 
 
+def cleanup_uploads(uploads_dir, max_age_minutes, max_total_mb, state):
+    now = time.time()
+    max_age_seconds = max_age_minutes * 60.0
+    max_total_bytes = max_total_mb * 1024 * 1024
+    current_source, _ = state.get_source()
+    current_source = os.path.abspath(current_source) if isinstance(current_source, str) else None
+
+    files = []
+    total_size = 0
+    for name in os.listdir(uploads_dir):
+        path = os.path.join(uploads_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        files.append((path, stat.st_mtime, stat.st_size))
+        total_size += stat.st_size
+
+    files.sort(key=lambda item: item[1])
+
+    for path, mtime, size in files:
+        if current_source and os.path.abspath(path) == current_source:
+            continue
+        if max_age_minutes > 0 and (now - mtime) >= max_age_seconds:
+            try:
+                os.remove(path)
+                total_size -= size
+            except OSError:
+                continue
+
+    if max_total_mb > 0 and total_size > max_total_bytes:
+        for path, _, size in files:
+            if current_source and os.path.abspath(path) == current_source:
+                continue
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+                total_size -= size
+            except OSError:
+                continue
+            if total_size <= max_total_bytes:
+                break
+
+
+def cleanup_loop(uploads_dir, max_age_minutes, max_total_mb, interval, state):
+    while True:
+        try:
+            cleanup_uploads(uploads_dir, max_age_minutes, max_total_mb, state)
+        except OSError:
+            pass
+        time.sleep(interval)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Web UI for real-time video inference.")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind.")
@@ -334,6 +390,25 @@ def parse_args():
         choices=("auto", "cpu", "cuda"),
         default="auto",
         help="Device for inference (default: auto).",
+    )
+    parser.add_argument("--uploads-dir", default="uploads", help="Upload storage directory.")
+    parser.add_argument(
+        "--cleanup-minutes",
+        type=int,
+        default=60,
+        help="Delete uploads older than N minutes (default: 60).",
+    )
+    parser.add_argument(
+        "--cleanup-max-mb",
+        type=int,
+        default=2048,
+        help="Keep uploads under this size in MB (default: 2048).",
+    )
+    parser.add_argument(
+        "--cleanup-interval",
+        type=int,
+        default=300,
+        help="Cleanup loop interval in seconds (default: 300).",
     )
     return parser.parse_args()
 
@@ -369,7 +444,7 @@ def make_handler(state, model, device, args):
             file_item = form["video"]
             if not file_item.filename:
                 return self._write_html("Empty filename", status=HTTPStatus.BAD_REQUEST)
-            uploads_dir = os.path.join(os.getcwd(), "uploads")
+            uploads_dir = os.path.abspath(args.uploads_dir)
             os.makedirs(uploads_dir, exist_ok=True)
             safe_name = os.path.basename(file_item.filename)
             out_path = os.path.join(uploads_dir, safe_name)
@@ -500,6 +575,21 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.model, device)
     state = AppState()
+    uploads_dir = os.path.abspath(args.uploads_dir)
+    os.makedirs(uploads_dir, exist_ok=True)
+    if args.cleanup_minutes > 0 or args.cleanup_max_mb > 0:
+        cleanup_thread = threading.Thread(
+            target=cleanup_loop,
+            args=(
+                uploads_dir,
+                args.cleanup_minutes,
+                args.cleanup_max_mb,
+                max(30, args.cleanup_interval),
+                state,
+            ),
+            daemon=True,
+        )
+        cleanup_thread.start()
     handler = make_handler(state, model, device, args)
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
     print(f"inference device: {device}")
