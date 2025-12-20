@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
         numpy \
         opencv-python-headless \
+    && pip install --no-cache-dir \
         torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY web_infer.py /app/web_infer.py
