@@ -198,6 +198,10 @@ HTML_PAGE = """<!DOCTYPE html>
       letter-spacing: 0.2px;
       box-shadow: 0 8px 18px rgba(12, 19, 29, 0.35);
     }
+    .status-chip.good {
+      background: rgba(82, 196, 138, 0.92);
+      color: #0f2a1f;
+    }
     .status-chip.bad {
       background: rgba(196, 38, 38, 0.92);
     }
@@ -306,6 +310,7 @@ HTML_PAGE = """<!DOCTYPE html>
       }
       if (statusChip) {
         statusChip.classList.toggle("bad", label === "abnormal");
+        statusChip.classList.toggle("good", label === "normal");
       }
     };
     const sendPlayback = () => {
