@@ -1,14 +1,19 @@
 import argparse
+import base64
 import cgi
-import io
+import hashlib
+import json
+import mimetypes
 import os
-import sys
 import socket
+import struct
+import sys
 import threading
 import time
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib import parse as urlparse
 
 import cv2
 import numpy as np
@@ -166,11 +171,45 @@ HTML_PAGE = """<!DOCTYPE html>
       text-transform: uppercase;
       letter-spacing: 1px;
     }
-    .viewer img {
+    .viewer video {
       width: 100%;
       border-radius: 14px;
       border: 1px solid #e4e6ea;
-      background: #f2f4f7;
+      background: #0f1217;
+    }
+    .video-shell {
+      position: relative;
+      border-radius: 14px;
+      overflow: hidden;
+      background: #0f1217;
+    }
+    .status-chip {
+      position: absolute;
+      left: 16px;
+      top: 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(20, 32, 40, 0.85);
+      color: #f7f8fb;
+      font-size: 13px;
+      letter-spacing: 0.2px;
+      box-shadow: 0 8px 18px rgba(12, 19, 29, 0.35);
+    }
+    .status-chip.bad {
+      background: rgba(196, 38, 38, 0.92);
+    }
+    .status-hint {
+      position: absolute;
+      inset: auto 16px 16px auto;
+      padding: 8px 12px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.9);
+      color: #1b2430;
+      font-size: 12px;
+      box-shadow: 0 10px 18px rgba(12, 19, 29, 0.2);
     }
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
@@ -199,9 +238,10 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="card">
       <h3>视频流地址</h3>
-      <p>输入 RTSP/HTTP 地址，利用我们的模型对实时视频流进行推理。</p>
+      <p>输入推理源地址（RTSP/HTTP/摄像头），并提供可在浏览器播放的地址（HLS/Web）。</p>
       <form action="/set_stream" method="post">
-        <input type="text" name="stream_url" placeholder="rtsp://... 或 http://... 或 0" />
+        <input type="text" name="stream_url" placeholder="推理源: rtsp://... 或 http://... 或 0" required />
+        <input type="text" name="play_url" placeholder="播放地址: HLS (.m3u8) 或浏览器可播放 URL" />
         <button type="submit">开始播放</button>
       </form>
     </div>
@@ -213,11 +253,21 @@ HTML_PAGE = """<!DOCTYPE html>
   </section>
   <section class="viewer">
     <h3><span>实时</span> 推理画面</h3>
-    <img src="/video_feed" width="800" />
+    <div class="video-shell">
+      <video id="streamVideo" controls playsinline muted></video>
+      <div class="status-chip" id="statusChip">
+        <span id="statusText">waiting</span>
+      </div>
+      <div class="status-hint" id="videoHint">未设置播放地址（摄像头/RTSP 需提供 HLS/WebRTC）</div>
+    </div>
   </section>
   <script>
     const input = document.getElementById("videoInput");
     const nameBox = document.getElementById("fileName");
+    const videoEl = document.getElementById("streamVideo");
+    const statusText = document.getElementById("statusText");
+    const statusChip = document.getElementById("statusChip");
+    const videoHint = document.getElementById("videoHint");
     if (input && nameBox) {
       input.addEventListener("change", () => {
         if (input.files && input.files.length > 0) {
@@ -227,6 +277,96 @@ HTML_PAGE = """<!DOCTYPE html>
         }
       });
     }
+    const setVideoSource = (url) => {
+      if (!url || !videoEl) return;
+      if (videoEl.dataset.src === url) return;
+      videoEl.dataset.src = url;
+      videoEl.src = url;
+      videoEl.load();
+      const playPromise = videoEl.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => {});
+      }
+      if (videoHint) {
+        videoHint.style.display = "none";
+      }
+    };
+    const updateStatus = (payload) => {
+      if (!payload) return;
+      if (payload.playback_url) {
+        setVideoSource(payload.playback_url);
+      }
+      if (videoHint) {
+        videoHint.style.display = payload.playback_url ? "none" : "block";
+      }
+      const label = payload.label || "idle";
+      const prob = typeof payload.prob === "number" ? payload.prob : 0;
+      if (statusText) {
+        statusText.textContent = `${label} (${prob.toFixed(2)})`;
+      }
+      if (statusChip) {
+        statusChip.classList.toggle("bad", label === "abnormal");
+      }
+    };
+    const sendPlayback = () => {
+      if (!videoEl || !videoEl.src) return;
+      const payload = {
+        time: videoEl.currentTime || 0,
+        paused: videoEl.paused,
+      };
+      fetch("/playback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    };
+    let playbackTimer = null;
+    const startPlaybackSync = () => {
+      if (playbackTimer) return;
+      playbackTimer = setInterval(sendPlayback, 250);
+    };
+    const stopPlaybackSync = () => {
+      if (!playbackTimer) return;
+      clearInterval(playbackTimer);
+      playbackTimer = null;
+    };
+    if (videoEl) {
+      videoEl.addEventListener("play", () => {
+        startPlaybackSync();
+        sendPlayback();
+      });
+      videoEl.addEventListener("pause", () => {
+        stopPlaybackSync();
+        sendPlayback();
+      });
+      videoEl.addEventListener("seeked", () => {
+        sendPlayback();
+      });
+      videoEl.addEventListener("loadedmetadata", () => {
+        sendPlayback();
+      });
+    }
+    const refreshStatus = () => {
+      fetch("/status")
+        .then((resp) => resp.json())
+        .then((payload) => updateStatus(payload))
+        .catch(() => {});
+    };
+    const connectWs = () => {
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
+      ws.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          updateStatus(payload);
+        } catch (err) {}
+      };
+      ws.onclose = () => {
+        setTimeout(connectWs, 2000);
+      };
+    };
+    refreshStatus();
+    connectWs();
   </script>
 </body>
 </html>
@@ -309,22 +449,65 @@ class AppState:
         self.lock = threading.Lock()
         self.source = None
         self.source_name = "none"
+        self.playback_url = ""
+        self.source_version = 0
+        self.last_label = "idle"
+        self.last_prob = 0.0
+        self.last_ts = 0.0
+        self.playback_time = None
+        self.playback_paused = True
+        self.playback_seq = 0
 
-    def set_source(self, source, name):
+    def set_source(self, source, name, playback_url=None):
         with self.lock:
             self.source = source
             self.source_name = name
+            if playback_url is not None:
+                self.playback_url = playback_url
+            self.source_version += 1
+            self.last_label = "warming up"
+            self.last_prob = 0.0
+            self.last_ts = time.time()
+            self.playback_time = None
+            self.playback_paused = True
+            self.playback_seq = 0
 
     def get_source(self):
         with self.lock:
-            return self.source, self.source_name
+            return self.source, self.source_name, self.source_version
+
+    def update_result(self, label, prob):
+        with self.lock:
+            self.last_label = label
+            self.last_prob = prob
+            self.last_ts = time.time()
+
+    def update_playback(self, time_sec, paused=False):
+        with self.lock:
+            self.playback_time = max(0.0, float(time_sec))
+            self.playback_paused = bool(paused)
+            self.playback_seq += 1
+
+    def get_playback(self):
+        with self.lock:
+            return self.playback_time, self.playback_paused, self.playback_seq
+
+    def get_status(self):
+        with self.lock:
+            return {
+                "source": self.source_name,
+                "playback_url": self.playback_url,
+                "label": self.last_label,
+                "prob": self.last_prob,
+                "timestamp": self.last_ts,
+            }
 
 
 def cleanup_uploads(uploads_dir, max_age_minutes, max_total_mb, state):
     now = time.time()
     max_age_seconds = max_age_minutes * 60.0
     max_total_bytes = max_total_mb * 1024 * 1024
-    current_source, _ = state.get_source()
+    current_source, _, _ = state.get_source()
     current_source = os.path.abspath(current_source) if isinstance(current_source, str) else None
 
     files = []
@@ -413,7 +596,228 @@ def parse_args():
     return parser.parse_args()
 
 
-def make_handler(state, model, device, args):
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def build_ws_frame(payload, opcode=0x1):
+    length = len(payload)
+    if length < 126:
+        header = struct.pack("!BB", 0x80 | opcode, length)
+    elif length < (1 << 16):
+        header = struct.pack("!BBH", 0x80 | opcode, 126, length)
+    else:
+        header = struct.pack("!BBQ", 0x80 | opcode, 127, length)
+    return header + payload
+
+
+def recv_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+class WebSocketClient:
+    def __init__(self, sock, addr):
+        self.sock = sock
+        self.addr = addr
+        self.lock = threading.Lock()
+
+    def send_frame(self, frame):
+        with self.lock:
+            self.sock.sendall(frame)
+
+
+class WebSocketHub:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = set()
+
+    def add(self, client):
+        with self.lock:
+            self.clients.add(client)
+
+    def remove(self, client):
+        with self.lock:
+            self.clients.discard(client)
+
+    def broadcast_json(self, payload):
+        data = json.dumps(payload).encode("utf-8")
+        frame = build_ws_frame(data, opcode=0x1)
+        with self.lock:
+            clients = list(self.clients)
+        for client in clients:
+            try:
+                client.send_frame(frame)
+            except OSError:
+                self.remove(client)
+
+    def send_json(self, client, payload):
+        data = json.dumps(payload).encode("utf-8")
+        frame = build_ws_frame(data, opcode=0x1)
+        client.send_frame(frame)
+
+
+class InferenceWorker(threading.Thread):
+    def __init__(self, state, hub, model, device, args):
+        super().__init__(daemon=True)
+        self.state = state
+        self.hub = hub
+        self.model = model
+        self.device = device
+        self.args = args
+
+    def _open_capture(self, source):
+        if isinstance(source, int):
+            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            if cap.isOpened():
+                return cap
+        return cv2.VideoCapture(source)
+
+    def _read_frame_at(self, cap, time_sec):
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, time_sec) * 1000.0)
+        ok, frame = cap.read()
+        if not ok:
+            return None
+        return frame
+
+    def _read_window(self, cap, target_time, interval):
+        start_time = target_time - interval * 4
+        frames = []
+        for i in range(5):
+            time_sec = start_time + i * interval
+            frame = self._read_frame_at(cap, time_sec)
+            if frame is None:
+                return None
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = pad_frame(gray, self.args.height, self.args.width)
+            frames.append(gray)
+        return frames
+
+    def run(self):
+        sample_interval = max(0.05, float(self.args.interval))
+        frame_buffer = deque(maxlen=5)
+        cap = None
+        current_version = -1
+        last_sample = 0.0
+        last_target_time = None
+
+        while True:
+            source, _, version = self.state.get_source()
+            playback_time, _, _ = self.state.get_playback()
+            if source is None:
+                if cap:
+                    cap.release()
+                    cap = None
+                time.sleep(0.2)
+                continue
+
+            if version != current_version or cap is None:
+                if cap:
+                    cap.release()
+                cap = self._open_capture(source)
+                current_version = version
+                frame_buffer.clear()
+                last_sample = 0.0
+                last_target_time = None
+                if not cap.isOpened():
+                    cap.release()
+                    cap = None
+                    self.state.update_result("source unavailable", 0.0)
+                    self.hub.broadcast_json(self.state.get_status())
+                    time.sleep(1.0)
+                    continue
+
+            is_file = isinstance(source, str) and os.path.isfile(source)
+            if is_file and playback_time is not None:
+                target_time = max(0.0, float(playback_time))
+                if last_target_time is not None and abs(target_time - last_target_time) < 1e-3:
+                    time.sleep(0.05)
+                    continue
+
+                delta = None if last_target_time is None else target_time - last_target_time
+                if last_target_time is None or abs(delta) > sample_interval * 1.25:
+                    frames = self._read_window(cap, target_time, sample_interval)
+                    if frames is None:
+                        self.state.update_result("source ended", 0.0)
+                        self.hub.broadcast_json(self.state.get_status())
+                        time.sleep(0.2)
+                        continue
+                    frame_buffer.clear()
+                    frame_buffer.extend(frames)
+                    last_target_time = target_time
+                else:
+                    if delta < sample_interval * 0.75:
+                        time.sleep(0.02)
+                        continue
+                    next_time = last_target_time + sample_interval
+                    frame = self._read_frame_at(cap, next_time)
+                    if frame is None:
+                        self.state.update_result("source ended", 0.0)
+                        self.hub.broadcast_json(self.state.get_status())
+                        time.sleep(0.2)
+                        continue
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    gray = pad_frame(gray, self.args.height, self.args.width)
+                    frame_buffer.append(gray)
+                    last_target_time = next_time
+                if len(frame_buffer) != 5:
+                    continue
+
+                diffs = diff_features(list(frame_buffer))
+                x = diffs.astype(np.float32)
+                x = (x - 127.5) / 127.5
+                x = torch.from_numpy(x).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    logits = self.model(x)
+                    prob = torch.sigmoid(logits).item()
+                label = "abnormal" if prob >= self.args.threshold else "normal"
+                self.state.update_result(label, prob)
+                self.hub.broadcast_json(self.state.get_status())
+                continue
+
+            now = time.time()
+            wait = sample_interval - (now - last_sample)
+            if wait > 0:
+                time.sleep(min(wait, 0.05))
+                continue
+
+            ok, frame = cap.read()
+            if not ok:
+                if self.args.loop and isinstance(source, str) and os.path.isfile(source):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                cap.release()
+                cap = None
+                self.state.update_result("source ended", 0.0)
+                self.hub.broadcast_json(self.state.get_status())
+                time.sleep(0.5)
+                continue
+
+            last_sample = time.time()
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = pad_frame(gray, self.args.height, self.args.width)
+            frame_buffer.append(gray)
+
+            if len(frame_buffer) != 5:
+                continue
+
+            diffs = diff_features(list(frame_buffer))
+            x = diffs.astype(np.float32)
+            x = (x - 127.5) / 127.5
+            x = torch.from_numpy(x).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                logits = self.model(x)
+                prob = torch.sigmoid(logits).item()
+            label = "abnormal" if prob >= self.args.threshold else "normal"
+            self.state.update_result(label, prob)
+            self.hub.broadcast_json(self.state.get_status())
+
+
+def make_handler(state, hub, args):
     class Handler(BaseHTTPRequestHandler):
         def _write_html(self, html, status=HTTPStatus.OK):
             data = html.encode("utf-8")
@@ -423,11 +827,23 @@ def make_handler(state, model, device, args):
             self.end_headers()
             self.wfile.write(data)
 
+        def _write_json(self, payload, status=HTTPStatus.OK):
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
             if self.path == "/" or self.path.startswith("/index"):
                 return self._write_html(HTML_PAGE)
-            if self.path.startswith("/video_feed"):
-                return self._stream_video()
+            if self.path.startswith("/status"):
+                return self._write_json(state.get_status())
+            if self.path.startswith("/ws"):
+                return self._handle_websocket()
+            if self.path.startswith("/uploads/"):
+                return self._serve_upload(self.path[len("/uploads/") :])
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
         def do_POST(self):
@@ -435,6 +851,8 @@ def make_handler(state, model, device, args):
                 return self._handle_upload()
             if self.path == "/set_stream":
                 return self._handle_stream()
+            if self.path == "/playback":
+                return self._handle_playback()
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
         def _handle_upload(self):
@@ -450,7 +868,9 @@ def make_handler(state, model, device, args):
             out_path = os.path.join(uploads_dir, safe_name)
             with open(out_path, "wb") as handle:
                 handle.write(file_item.file.read())
-            state.set_source(out_path, safe_name)
+            playback_url = f"/uploads/{urlparse.quote(safe_name)}"
+            state.set_source(out_path, safe_name, playback_url=playback_url)
+            hub.broadcast_json(state.get_status())
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/")
             self.end_headers()
@@ -458,99 +878,169 @@ def make_handler(state, model, device, args):
         def _handle_stream(self):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length).decode("utf-8")
-            params = {}
-            for part in body.split("&"):
-                if "=" in part:
-                    key, value = part.split("=", 1)
-                    params[key] = value.replace("+", " ")
-            stream_url = params.get("stream_url", "").strip()
+            params = urlparse.parse_qs(body, keep_blank_values=True)
+            stream_url = params.get("stream_url", [""])[0].strip()
+            play_url = params.get("play_url", [""])[0].strip()
             if not stream_url:
                 return self._write_html("Empty stream url", status=HTTPStatus.BAD_REQUEST)
             if stream_url.isdigit():
                 source = int(stream_url)
             else:
                 source = stream_url
-            state.set_source(source, str(stream_url))
+            playback_url = play_url
+            if not playback_url and stream_url.startswith(("http://", "https://")):
+                playback_url = stream_url
+            state.set_source(source, str(stream_url), playback_url=playback_url)
+            hub.broadcast_json(state.get_status())
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/")
             self.end_headers()
 
-        def _stream_video(self):
-            source, _ = state.get_source()
-            if source is None:
-                return self._write_html("No source selected.", status=HTTPStatus.OK)
-
-            cap = cv2.VideoCapture(source)
-            if not cap.isOpened():
-                return self._write_html("Failed to open source.", status=HTTPStatus.BAD_REQUEST)
-
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        def _handle_playback(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Missing body")
+                return
+            body = self.rfile.read(length).decode("utf-8")
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+                return
+            if "time" not in payload:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Missing time")
+                return
+            try:
+                time_value = float(payload["time"])
+            except (TypeError, ValueError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid time")
+                return
+            paused = bool(payload.get("paused", False))
+            state.update_playback(time_value, paused)
+            self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
 
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if not fps or fps <= 1e-3 or np.isnan(fps):
-                fps = 30.0
-            frame_interval = 1.0 / float(fps)
-            sample_interval = max(0.01, float(args.interval))
-            frame_buffer = deque(maxlen=5)
-            last_sample = 0.0
-            last_label = "warming up"
-            last_prob = 0.0
+        def _serve_upload(self, name):
+            decoded = urlparse.unquote(name)
+            safe_name = os.path.basename(decoded)
+            if safe_name != decoded:
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+            uploads_dir = os.path.abspath(args.uploads_dir)
+            path = os.path.join(uploads_dir, safe_name)
+            if not os.path.isfile(path):
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+            self._send_file(path)
 
-            while True:
-                loop_start = time.time()
-                ok, frame = cap.read()
-                if not ok:
-                    if args.loop and isinstance(source, str) and os.path.isfile(source):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
-                    print("stream ended or frame read failed.")
-                    break
+        def _send_file(self, path):
+            size = os.path.getsize(path)
+            content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            range_header = self.headers.get("Range")
+            start = 0
+            end = size - 1
+            status = HTTPStatus.OK
 
-                now = time.time()
-                if now - last_sample >= sample_interval:
-                    last_sample = now
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    gray = pad_frame(gray, args.height, args.width)
-                    frame_buffer.append(gray)
-                    if len(frame_buffer) == 5:
-                        diffs = diff_features(list(frame_buffer))
-                        x = diffs.astype(np.float32)
-                        x = (x - 127.5) / 127.5
-                        x = torch.from_numpy(x).unsqueeze(0).to(device)
-                        with torch.no_grad():
-                            logits = model(x)
-                            prob = torch.sigmoid(logits).item()
-                        last_prob = prob
-                        last_label = "abnormal" if prob >= args.threshold else "normal"
-
-                label_text = f"{last_label} ({last_prob:.2f})"
-                cv2.putText(
-                    frame,
-                    label_text,
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 0, 255) if last_label == "abnormal" else (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-                ok, encoded = cv2.imencode(".jpg", frame)
-                if not ok:
-                    continue
-                payload = encoded.tobytes()
+            if range_header and range_header.startswith("bytes="):
                 try:
-                    self.wfile.write(b"--frame\r\n")
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
-                    self.wfile.write(payload)
-                    self.wfile.write(b"\r\n")
-                except BrokenPipeError:
+                    range_spec = range_header.replace("bytes=", "", 1).strip()
+                    if "," not in range_spec:
+                        start_text, end_text = range_spec.split("-", 1)
+                        if start_text:
+                            start = int(start_text)
+                            if end_text:
+                                end = int(end_text)
+                        else:
+                            suffix = int(end_text)
+                            start = max(0, size - suffix)
+                        end = min(end, size - 1)
+                        if start <= end:
+                            status = HTTPStatus.PARTIAL_CONTENT
+                        else:
+                            self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                            return
+                except ValueError:
+                    self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    return
+
+            length = end - start + 1
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Accept-Ranges", "bytes")
+            if status == HTTPStatus.PARTIAL_CONTENT:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+
+            with open(path, "rb") as handle:
+                if start:
+                    handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    remaining -= len(chunk)
+
+        def _handle_websocket(self):
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Missing WebSocket key")
+                return
+            accept_src = (key + WS_GUID).encode("utf-8")
+            accept = base64.b64encode(hashlib.sha1(accept_src).digest()).decode("ascii")
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            self.end_headers()
+
+            client = WebSocketClient(self.request, self.client_address)
+            hub.add(client)
+            try:
+                hub.send_json(client, state.get_status())
+                self._ws_read_loop(client)
+            finally:
+                hub.remove(client)
+
+        def _ws_read_loop(self, client):
+            sock = client.sock
+            while True:
+                header = recv_exact(sock, 2)
+                if header is None:
                     break
-                elapsed = time.time() - loop_start
-                if elapsed < frame_interval:
-                    time.sleep(frame_interval - elapsed)
-            cap.release()
+                b1, b2 = header
+                opcode = b1 & 0x0F
+                masked = b2 & 0x80
+                length = b2 & 0x7F
+                if length == 126:
+                    ext = recv_exact(sock, 2)
+                    if ext is None:
+                        break
+                    length = struct.unpack("!H", ext)[0]
+                elif length == 127:
+                    ext = recv_exact(sock, 8)
+                    if ext is None:
+                        break
+                    length = struct.unpack("!Q", ext)[0]
+                mask = recv_exact(sock, 4) if masked else None
+                payload = recv_exact(sock, length) if length else b""
+                if payload is None:
+                    break
+                if mask:
+                    payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    pong = build_ws_frame(payload, opcode=0xA)
+                    try:
+                        client.send_frame(pong)
+                    except OSError:
+                        break
 
         def log_message(self, format, *args):
             return
@@ -575,6 +1065,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.model, device)
     state = AppState()
+    hub = WebSocketHub()
     uploads_dir = os.path.abspath(args.uploads_dir)
     os.makedirs(uploads_dir, exist_ok=True)
     if args.cleanup_minutes > 0 or args.cleanup_max_mb > 0:
@@ -590,7 +1081,9 @@ def main():
             daemon=True,
         )
         cleanup_thread.start()
-    handler = make_handler(state, model, device, args)
+    worker = InferenceWorker(state, hub, model, device, args)
+    worker.start()
+    handler = make_handler(state, hub, args)
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
     print(f"inference device: {device}")
     print(f"local: http://127.0.0.1:{args.port}")
