@@ -29,7 +29,7 @@ deploy/
 ```yaml
 services:
   webinfer:
-    image: mvopt-webinfer:latest
+    image: ghcr.io/zju-mvopt/mv-infer:latest
     container_name: mvopt-webinfer
     ports:
       - "8000:8000"
