@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import sys
 import time
@@ -14,6 +15,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a CNN on diff features (.npy).")
     parser.add_argument("--features", default="features.npy", help="Path to features .npy.")
     parser.add_argument("--labels", default="labels.npy", help="Path to labels .npy.")
+    parser.add_argument(
+        "--group-labels",
+        default="labels.csv",
+        help="Group labels CSV for video-isolated test split (default: labels.csv).",
+    )
+    parser.add_argument(
+        "--images-dir",
+        default="images",
+        help="Images root for verifying group labels (default: images).",
+    )
     parser.add_argument("--out-dir", default="runs", help="Output directory for logs/checkpoints.")
     parser.add_argument("--run-name", default="", help="Run name (default: timestamp).")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint.")
@@ -28,7 +39,28 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
     parser.add_argument("--val-split", type=float, default=0.1, help="Validation split ratio.")
-    parser.add_argument("--test-split", type=float, default=0.1, help="Test split ratio.")
+    parser.add_argument(
+        "--test-split",
+        type=float,
+        default=0.1,
+        help="Test split ratio (only used when --no-video-test-split is set).",
+    )
+    parser.add_argument(
+        "--test-videos",
+        default="abnormal/6,normal/1",
+        help="Comma-separated video IDs for the test set (e.g. abnormal/1,normal/2).",
+    )
+    parser.add_argument(
+        "--num-test-videos",
+        type=int,
+        default=2,
+        help="Number of videos for the test set (1-2, used when --test-videos is empty).",
+    )
+    parser.add_argument(
+        "--no-video-test-split",
+        action="store_true",
+        help="Disable video-isolated test split and use random stratified split.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
     parser.add_argument(
@@ -75,6 +107,127 @@ def stratified_split(labels, val_ratio, test_ratio, seed):
     rng.shuffle(val_idx)
     rng.shuffle(test_idx)
     return np.array(train_idx), np.array(val_idx), np.array(test_idx)
+
+
+def read_group_labels(labels_file):
+    if not os.path.exists(labels_file):
+        raise FileNotFoundError(f"labels file not found: {labels_file}")
+    with open(labels_file, "r", newline="") as handle:
+        reader = csv.reader(handle)
+        rows = list(reader)
+    if not rows:
+        return []
+    start = 0
+    header = [cell.strip().lower() for cell in rows[0]]
+    if header and header[0] in {"group_id", "path_1", "path"}:
+        start = 1
+        if header[0] == "path" and "group_id" not in header and "path_1" not in header:
+            raise ValueError("labels file looks like per-image format; expected group labels.")
+    entries = []
+    for row in rows[start:]:
+        if len(row) < 2:
+            continue
+        group_id = row[0]
+        label = row[1]
+        paths = []
+        if len(row) >= 7:
+            paths = [cell for cell in row[2:7] if cell]
+        entries.append({"group_id": group_id, "label": label, "paths": paths})
+    return entries
+
+
+def label_to_int(value):
+    text = str(value).strip().lower()
+    if text in {"normal", "0"}:
+        return 0
+    if text in {"abnormal", "1"}:
+        return 1
+    raise ValueError(f"unknown label: {value}")
+
+
+def all_files_exist(paths, images_dir):
+    for rel_path in paths:
+        abs_path = os.path.join(images_dir, rel_path)
+        if not os.path.isfile(abs_path):
+            return False
+    return True
+
+
+def extract_video_id(path):
+    video_id = os.path.dirname(path)
+    if not video_id:
+        video_id = path
+    return video_id.replace("\\", "/")
+
+
+def build_video_ids(labels_file, images_dir):
+    entries = read_group_labels(labels_file)
+    if not entries:
+        raise ValueError("no group labels found for video split.")
+    images_dir = os.path.abspath(images_dir)
+    video_ids = []
+    for entry in entries:
+        paths = entry["paths"]
+        if len(paths) != 5:
+            continue
+        try:
+            label_to_int(entry["label"])
+        except ValueError:
+            continue
+        if not all_files_exist(paths, images_dir):
+            continue
+        video_ids.append(extract_video_id(paths[0]))
+    return video_ids
+
+
+def parse_test_videos(value):
+    if not value:
+        return []
+    raw = [item.strip() for item in value.split(",") if item.strip()]
+    seen = set()
+    ordered = []
+    for item in raw:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def select_test_videos(video_ids, requested, num_test_videos, seed):
+    unique_videos = sorted(set(video_ids))
+    if requested:
+        if not (1 <= len(requested) <= 2):
+            raise ValueError("test videos must contain 1-2 items.")
+        missing = [vid for vid in requested if vid not in unique_videos]
+        if missing:
+            raise ValueError(f"unknown test videos: {', '.join(missing)}")
+        return requested
+    if not (1 <= num_test_videos <= 2):
+        raise ValueError("--num-test-videos must be 1 or 2.")
+    if not unique_videos:
+        raise ValueError("no videos available for test split.")
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_videos)
+    count = min(num_test_videos, len(unique_videos))
+    return unique_videos[:count]
+
+
+def split_with_video_test(labels, video_ids, val_ratio, seed, test_videos):
+    labels = np.asarray(labels)
+    video_ids = np.asarray(video_ids)
+    indices = np.arange(labels.shape[0])
+    test_mask = np.isin(video_ids, test_videos)
+    test_idx = indices[test_mask]
+    remaining_idx = indices[~test_mask]
+    if len(test_idx) == 0:
+        raise ValueError("video test split produced empty test set.")
+    if len(remaining_idx) == 0:
+        raise ValueError("video test split removed all training data.")
+    train_sub, val_sub, _ = stratified_split(labels[remaining_idx], val_ratio, 0.0, seed)
+    train_idx = remaining_idx[train_sub]
+    val_idx = remaining_idx[val_sub]
+    return train_idx, val_idx, test_idx
 
 
 class DiffDataset(Dataset):
@@ -184,7 +337,9 @@ def evaluate(model, loader, device, loss_fn):
     return avg_loss, acc, prec, rec, f1
 
 
-def save_checkpoint(path, epoch, model, optimizer, best_f1, train_idx, val_idx, test_idx):
+def save_checkpoint(
+    path, epoch, model, optimizer, best_f1, train_idx, val_idx, test_idx, test_videos
+):
     torch.save(
         {
             "epoch": epoch,
@@ -194,6 +349,7 @@ def save_checkpoint(path, epoch, model, optimizer, best_f1, train_idx, val_idx, 
             "train_idx": np.asarray(train_idx),
             "val_idx": np.asarray(val_idx),
             "test_idx": np.asarray(test_idx),
+            "test_videos": list(test_videos) if test_videos else None,
         },
         path,
     )
@@ -236,6 +392,7 @@ def main():
     checkpoint = None
     model_state = None
     train_idx = val_idx = test_idx = None
+    test_videos = None
     if args.resume_path:
         checkpoint_path = args.resume_path
     elif args.resume:
@@ -256,6 +413,7 @@ def main():
             train_idx = checkpoint.get("train_idx")
             val_idx = checkpoint.get("val_idx")
             test_idx = checkpoint.get("test_idx")
+            test_videos = checkpoint.get("test_videos")
         elif kind == "state_dict":
             model_state = loaded
             print(
@@ -267,15 +425,51 @@ def main():
             return 1
 
     if train_idx is None or val_idx is None or test_idx is None:
-        train_idx, val_idx, test_idx = stratified_split(
-            labels, args.val_split, args.test_split, args.seed
-        )
+        if args.no_video_test_split:
+            train_idx, val_idx, test_idx = stratified_split(
+                labels, args.val_split, args.test_split, args.seed
+            )
+        else:
+            if not os.path.isfile(args.group_labels):
+                print(
+                    f"error: group labels file not found: {args.group_labels}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not os.path.isdir(args.images_dir):
+                print(f"error: images dir not found: {args.images_dir}", file=sys.stderr)
+                return 1
+            try:
+                video_ids = build_video_ids(args.group_labels, args.images_dir)
+            except (ValueError, FileNotFoundError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            if len(video_ids) != len(labels):
+                print(
+                    "error: video label count does not match dataset size. "
+                    "Rebuild features or verify labels/images.",
+                    file=sys.stderr,
+                )
+                return 1
+            requested_videos = parse_test_videos(args.test_videos)
+            try:
+                test_videos = select_test_videos(
+                    video_ids, requested_videos, args.num_test_videos, args.seed
+                )
+                train_idx, val_idx, test_idx = split_with_video_test(
+                    labels, video_ids, args.val_split, args.seed, test_videos
+                )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
     train_idx = np.asarray(train_idx)
     val_idx = np.asarray(val_idx)
     test_idx = np.asarray(test_idx)
     if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
         print("error: split produced empty subset. Adjust split ratios.", file=sys.stderr)
         return 1
+    if test_videos:
+        print(f"test videos: {', '.join(test_videos)}")
 
     train_set = Subset(dataset, train_idx)
     val_set = Subset(dataset, val_idx)
@@ -317,7 +511,8 @@ def main():
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pos_weight = torch.tensor([neg_count / float(pos_count)], dtype=torch.float32, device=device)
+    # pos_weight = torch.tensor([neg_count / float(pos_count)], dtype=torch.float32, device=device)
+    pos_weight = torch.tensor([1.0], dtype=torch.float32, device=device)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     model = SimpleCNN(in_channels=4).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -332,6 +527,8 @@ def main():
     writer = SummaryWriter(log_dir=out_dir)
     writer.add_text("config", str(vars(args)))
     writer.add_text("class_counts", f"pos={pos_count}, neg={neg_count}")
+    if test_videos:
+        writer.add_text("test_videos", ", ".join(test_videos))
 
     best_f1 = -1.0
     start_epoch = 1
@@ -399,6 +596,7 @@ def main():
             train_idx,
             val_idx,
             test_idx,
+            test_videos,
         )
 
         print(
