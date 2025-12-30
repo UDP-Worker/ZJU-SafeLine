@@ -1,0 +1,18 @@
+FROM python:3.10-windowsservercore-ltsc2022
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+RUN python -m pip install --upgrade pip ; `
+    pip install --no-cache-dir numpy opencv-python-headless ; `
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY web_infer.py /app/web_infer.py
+
+EXPOSE 8000
+
+CMD ["python", "web_infer.py", "--model", "C:/models/final_model.pt", "--port", "8000"]
