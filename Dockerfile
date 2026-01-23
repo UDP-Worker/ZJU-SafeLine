@@ -19,9 +19,17 @@ RUN apt-get update \
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip \
     && python3 -m pip install --no-cache-dir \
-        torch --index-url https://download.pytorch.org/whl/cpu
+        torch --index-url https://download.pytorch.org/whl/cpu \
+    && python3 -m pip install --no-cache-dir \
+        fastapi \
+        uvicorn \
+        websockets \
+        python-multipart \
+        "starlette>=0.49.1"
 
 COPY web_infer.py /app/web_infer.py
+COPY static /app/static
+COPY templates /app/templates
 
 EXPOSE 8000
 

@@ -63,6 +63,19 @@ python train_diff_model.py
 
 默认配置下，`logdir` 被设置为 `runs`. `tensorboard` 启动后，可以在 ` http://localhost:6006/` 查看训练和测试指标。
 
+##### 6.Web 推理与可视化
+
+使用训练完成的模型启动推理服务（默认端口 8000）：
+
+```
+python web_infer.py --model final_model.pt --port 8000
+```
+
+启动后访问 `http://127.0.0.1:8000` 即可上传视频或配置推理源。  
+可选参数：
+- `--uploads-dir` 设置上传目录（默认 `uploads`）
+- `--max-upload-mb` 限制单个上传文件大小（默认 2048MB）
+
 
 
 #### 容器化部署
@@ -98,7 +111,7 @@ services:
       - ./models:/models:ro
       - ./uploads:/app/uploads
     command:
-      - python
+      - python3
       - web_infer.py
       - --model
       - /models/final_model.pt
@@ -121,6 +134,8 @@ services:
       - "512"
       - --cleanup-interval
       - "300"
+      - --max-upload-mb
+      - "512"
 ```
 
 启动：
@@ -146,13 +161,14 @@ docker compose up -d
 
 ```
 ZJU-SafeLine
-	├── build_diff_dataset.py
+    ├── build_diff_dataset.py
     ├── data_process.py
     ├── label.py
     ├── train_diff_model.py
     ├── web_infer.py
+    ├── static
+    ├── templates
     └── env.yml
 ```
 
-`data_process.py` 从提供的视频中按帧提取所有的图片信息，并进行必要的预处理，`label.py` 提供一个可视化的数据标注程序，允许用户高效地对图片进行标注，`build_diff_dataset.py` 读取用户标注的标签，并将图片和标签对应，形成数据集，`train_diff_model.py` 训练深度学习模型，检测是否发生了违规操作，`web_infer.py` 提供一用户界面，利用已经训练完成的模型，对用户上传的视频或者实时视频流进行推理。
-
+`data_process.py` 从提供的视频中按帧提取所有的图片信息，并进行必要的预处理，`label.py` 提供一个可视化的数据标注程序，允许用户高效地对图片进行标注，`build_diff_dataset.py` 读取用户标注的标签，并将图片和标签对应，形成数据集，`train_diff_model.py` 训练深度学习模型，检测是否发生了违规操作，`web_infer.py` 提供基于 FastAPI 的推理服务与 Web UI，`static/` 和 `templates/` 保存前端静态资源与页面模板。
