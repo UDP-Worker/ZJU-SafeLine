@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from urllib import parse as urlparse
@@ -24,6 +25,45 @@ from torch import nn
 BASE_DIR = os.path.dirname(__file__)
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+ALLOWED_UPLOAD_EXTS = {
+    ".avi",
+    ".flv",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".ts",
+    ".webm",
+}
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def is_invalid_name(name):
+    return not name or name in {".", ".."} or "/" in name or "\\" in name
+
+
+def resolve_upload_path(uploads_dir, name):
+    decoded = urlparse.unquote(name)
+    if is_invalid_name(decoded):
+        return None
+    if os.path.basename(decoded) != decoded:
+        return None
+    path = os.path.abspath(os.path.join(uploads_dir, decoded))
+    if os.path.commonpath([path, uploads_dir]) != uploads_dir:
+        return None
+    return path
+
+
+def generate_upload_name(original_name):
+    base_name = os.path.basename(original_name)
+    if is_invalid_name(base_name):
+        return None
+    ext = os.path.splitext(base_name)[1].lower()
+    if ext not in ALLOWED_UPLOAD_EXTS:
+        return None
+    return f"{uuid.uuid4().hex}{ext}", base_name
 
 
 class SimpleCNN(nn.Module):
@@ -204,13 +244,13 @@ def cleanup_uploads(uploads_dir, max_age_minutes, max_total_mb, state):
                 break
 
 
-def cleanup_loop(uploads_dir, max_age_minutes, max_total_mb, interval, state):
-    while True:
+def cleanup_loop(uploads_dir, max_age_minutes, max_total_mb, interval, state, stop_event):
+    while not stop_event.is_set():
         try:
             cleanup_uploads(uploads_dir, max_age_minutes, max_total_mb, state)
         except OSError:
             pass
-        time.sleep(interval)
+        stop_event.wait(interval)
 
 
 def parse_args():
@@ -229,6 +269,12 @@ def parse_args():
         help="Device for inference (default: auto).",
     )
     parser.add_argument("--uploads-dir", default="uploads", help="Upload storage directory.")
+    parser.add_argument(
+        "--max-upload-mb",
+        type=int,
+        default=2048,
+        help="Reject uploads larger than this size in MB (default: 2048).",
+    )
     parser.add_argument(
         "--cleanup-minutes",
         type=int,
@@ -296,7 +342,10 @@ class Broadcaster:
             except asyncio.QueueFull:
                 pass
 
-        self.loop.call_soon_threadsafe(_offer)
+        try:
+            self.loop.call_soon_threadsafe(_offer)
+        except RuntimeError:
+            return
 
     async def run(self):
         while True:
@@ -305,13 +354,20 @@ class Broadcaster:
 
 
 class InferenceWorker(threading.Thread):
-    def __init__(self, state, broadcaster, model, device, args):
+    def __init__(self, state, broadcaster, model, device, args, stop_event=None):
         super().__init__(daemon=True)
         self.state = state
         self.broadcaster = broadcaster
         self.model = model
         self.device = device
         self.args = args
+        self.stop_event = stop_event or threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _wait(self, timeout):
+        return self.stop_event.wait(timeout)
 
     def _open_capture(self, source):
         if isinstance(source, int):
@@ -348,14 +404,15 @@ class InferenceWorker(threading.Thread):
         last_sample = 0.0
         last_target_time = None
 
-        while True:
+        while not self.stop_event.is_set():
             source, _, version = self.state.get_source()
             playback_time, _, _ = self.state.get_playback()
             if source is None:
                 if cap:
                     cap.release()
                     cap = None
-                time.sleep(0.2)
+                if self._wait(0.2):
+                    break
                 continue
 
             if version != current_version or cap is None:
@@ -371,14 +428,16 @@ class InferenceWorker(threading.Thread):
                     cap = None
                     self.state.update_result("source unavailable", 0.0)
                     self.broadcaster.publish(self.state.get_status())
-                    time.sleep(1.0)
+                    if self._wait(1.0):
+                        break
                     continue
 
             is_file = isinstance(source, str) and os.path.isfile(source)
             if is_file and playback_time is not None:
                 target_time = max(0.0, float(playback_time))
                 if last_target_time is not None and abs(target_time - last_target_time) < 1e-3:
-                    time.sleep(0.05)
+                    if self._wait(0.05):
+                        break
                     continue
 
                 delta = None if last_target_time is None else target_time - last_target_time
@@ -387,21 +446,24 @@ class InferenceWorker(threading.Thread):
                     if frames is None:
                         self.state.update_result("source ended", 0.0)
                         self.broadcaster.publish(self.state.get_status())
-                        time.sleep(0.2)
+                        if self._wait(0.2):
+                            break
                         continue
                     frame_buffer.clear()
                     frame_buffer.extend(frames)
                     last_target_time = target_time
                 else:
                     if delta < sample_interval * 0.75:
-                        time.sleep(0.02)
+                        if self._wait(0.02):
+                            break
                         continue
                     next_time = last_target_time + sample_interval
                     frame = self._read_frame_at(cap, next_time)
                     if frame is None:
                         self.state.update_result("source ended", 0.0)
                         self.broadcaster.publish(self.state.get_status())
-                        time.sleep(0.2)
+                        if self._wait(0.2):
+                            break
                         continue
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     gray = pad_frame(gray, self.args.height, self.args.width)
@@ -425,7 +487,8 @@ class InferenceWorker(threading.Thread):
             now = time.time()
             wait = sample_interval - (now - last_sample)
             if wait > 0:
-                time.sleep(min(wait, 0.05))
+                if self._wait(min(wait, 0.05)):
+                    break
                 continue
 
             ok, frame = cap.read()
@@ -437,7 +500,8 @@ class InferenceWorker(threading.Thread):
                 cap = None
                 self.state.update_result("source ended", 0.0)
                 self.broadcaster.publish(self.state.get_status())
-                time.sleep(0.5)
+                if self._wait(0.5):
+                    break
                 continue
 
             last_sample = time.time()
@@ -471,6 +535,8 @@ def create_app(args, model, device):
     broadcaster = Broadcaster(manager)
     uploads_dir = os.path.abspath(args.uploads_dir)
     os.makedirs(uploads_dir, exist_ok=True)
+    cleanup_stop = threading.Event()
+    worker_stop = threading.Event()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -485,20 +551,35 @@ def create_app(args, model, device):
                     args.cleanup_max_mb,
                     max(30, args.cleanup_interval),
                     state,
+                    cleanup_stop,
                 ),
                 daemon=True,
             )
             cleanup_thread.start()
             app.state.cleanup_thread = cleanup_thread
-        worker = InferenceWorker(state, broadcaster, model, device, args)
+        worker = InferenceWorker(state, broadcaster, model, device, args, stop_event=worker_stop)
         worker.start()
         app.state.worker = worker
+        app.state.cleanup_stop = cleanup_stop
+        app.state.worker_stop = worker_stop
         yield
         task = getattr(app.state, "broadcast_task", None)
         if task:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        worker = getattr(app.state, "worker", None)
+        worker_stop_signal = getattr(app.state, "worker_stop", None)
+        if worker_stop_signal:
+            worker_stop_signal.set()
+        if worker:
+            worker.join(timeout=2.0)
+        cleanup_thread = getattr(app.state, "cleanup_thread", None)
+        cleanup_stop_signal = getattr(app.state, "cleanup_stop", None)
+        if cleanup_stop_signal:
+            cleanup_stop_signal.set()
+        if cleanup_thread:
+            cleanup_thread.join(timeout=2.0)
 
     app = FastAPI(lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -516,11 +597,11 @@ def create_app(args, model, device):
 
     @app.get("/uploads/{name}")
     async def uploads(name: str):
-        decoded = urlparse.unquote(name)
-        safe_name = os.path.basename(decoded)
-        if safe_name != decoded:
+        path = resolve_upload_path(uploads_dir, name)
+        if not path:
             raise HTTPException(status_code=404, detail="Not Found")
-        path = os.path.join(uploads_dir, safe_name)
+        if os.path.splitext(path)[1].lower() not in ALLOWED_UPLOAD_EXTS:
+            raise HTTPException(status_code=404, detail="Not Found")
         if not os.path.isfile(path):
             raise HTTPException(status_code=404, detail="Not Found")
         media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -530,19 +611,42 @@ def create_app(args, model, device):
     async def upload(video: UploadFile = File(...)):
         if not video.filename:
             raise HTTPException(status_code=400, detail="Empty filename")
-        safe_name = os.path.basename(video.filename)
-        if not safe_name:
-            raise HTTPException(status_code=400, detail="Empty filename")
-        out_path = os.path.join(uploads_dir, safe_name)
-        with open(out_path, "wb") as handle:
-            while True:
-                chunk = await video.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
+        generated = generate_upload_name(video.filename)
+        if not generated:
+            raise HTTPException(status_code=400, detail="Unsupported filename")
+        server_name, display_name = generated
+        ext = os.path.splitext(server_name)[1]
+        out_path = os.path.join(uploads_dir, server_name)
+        for _ in range(10):
+            if not os.path.exists(out_path):
+                break
+            server_name = f"{uuid.uuid4().hex}{ext}"
+            out_path = os.path.join(uploads_dir, server_name)
+        max_bytes = max(1, int(args.max_upload_mb)) * 1024 * 1024
+        written = 0
+        try:
+            with open(out_path, "wb") as handle:
+                while True:
+                    chunk = await video.read(UPLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise HTTPException(status_code=413, detail="Upload too large")
+                    handle.write(chunk)
+        except HTTPException:
+            await video.close()
+            with suppress(OSError):
+                os.remove(out_path)
+            raise
+        except Exception:
+            await video.close()
+            with suppress(OSError):
+                os.remove(out_path)
+            raise
         await video.close()
-        playback_url = f"/uploads/{urlparse.quote(safe_name)}"
-        state.set_source(out_path, safe_name, playback_url=playback_url)
+        playback_url = f"/uploads/{urlparse.quote(server_name)}"
+        state.set_source(out_path, display_name, playback_url=playback_url)
         broadcaster.publish(state.get_status())
         return RedirectResponse(url="/", status_code=303)
 
@@ -574,7 +678,10 @@ def create_app(args, model, device):
         try:
             await websocket.send_json(state.get_status())
             while True:
-                await websocket.receive_text()
+                try:
+                    await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    continue
         except WebSocketDisconnect:
             manager.disconnect(websocket)
         except Exception:
