@@ -1,0 +1,189 @@
+:root {
+  --ink: #0c131d;
+  --muted: #5b6675;
+  --accent: #1f7a5e;
+  --accent-2: #e2b451;
+  --card: #ffffff;
+  --stroke: #d9dde3;
+  --shadow: 0 18px 40px rgba(15, 20, 30, 0.12);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "Avenir Next", "Gill Sans", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 10% 20%, #f9f1d8 0%, rgba(249, 241, 216, 0) 50%),
+    radial-gradient(circle at 80% 0%, #d7efe3 0%, rgba(215, 239, 227, 0) 45%),
+    linear-gradient(135deg, #f7f8fb 0%, #eef1f6 100%);
+  min-height: 100vh;
+  padding: 32px 24px 60px;
+}
+header {
+  max-width: 1100px;
+  margin: 0 auto 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+.title {
+  font-size: 28px;
+  letter-spacing: -0.5px;
+  margin: 0;
+}
+.subtitle {
+  color: var(--muted);
+  margin-top: 6px;
+  font-size: 15px;
+}
+.pill {
+  background: rgba(31, 122, 94, 0.12);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.layout {
+  max-width: 1100px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 20px;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 16px;
+  padding: 18px;
+  box-shadow: var(--shadow);
+  animation: rise 0.5s ease-out;
+}
+.card h3 {
+  margin: 0 0 12px;
+  font-size: 18px;
+}
+.card p {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+input[type="file"], input[type="text"] {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  font-size: 14px;
+}
+button {
+  margin-top: 12px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: none;
+  background: linear-gradient(135deg, var(--accent) 0%, #1d5f86 100%);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.file-input {
+  display: none;
+}
+.file-button {
+  display: inline-block;
+  padding: 9px 14px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #27354a 0%, #1f7a5e 100%);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: none;
+}
+.file-name {
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+button:hover { transform: translateY(-1px); }
+.viewer {
+  max-width: 1100px;
+  margin: 28px auto 0;
+  background: var(--card);
+  border-radius: 20px;
+  border: 1px solid var(--stroke);
+  box-shadow: var(--shadow);
+  padding: 18px;
+  animation: fade 0.7s ease-out;
+}
+.viewer h3 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.viewer h3 span {
+  color: var(--accent-2);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.viewer video {
+  width: 100%;
+  border-radius: 14px;
+  border: 1px solid #e4e6ea;
+  background: #0f1217;
+}
+.video-shell {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #0f1217;
+}
+.status-chip {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(20, 32, 40, 0.85);
+  color: #f7f8fb;
+  font-size: 13px;
+  letter-spacing: 0.2px;
+  box-shadow: 0 8px 18px rgba(12, 19, 29, 0.35);
+}
+.status-chip.good {
+  background: rgba(82, 196, 138, 0.92);
+  color: #0f2a1f;
+}
+.status-chip.bad {
+  background: rgba(196, 38, 38, 0.92);
+}
+.status-hint {
+  position: absolute;
+  inset: auto 16px 16px auto;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #1b2430;
+  font-size: 12px;
+  box-shadow: 0 10px 18px rgba(12, 19, 29, 0.2);
+}
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }

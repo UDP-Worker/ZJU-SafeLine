@@ -21,361 +21,7 @@ import torch
 from torch import nn
 
 
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>视频异常监测</title>
-  <style>
-    :root {
-      --ink: #0c131d;
-      --muted: #5b6675;
-      --accent: #1f7a5e;
-      --accent-2: #e2b451;
-      --card: #ffffff;
-      --stroke: #d9dde3;
-      --shadow: 0 18px 40px rgba(15, 20, 30, 0.12);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Space Grotesk", "Avenir Next", "Gill Sans", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at 10% 20%, #f9f1d8 0%, rgba(249, 241, 216, 0) 50%),
-        radial-gradient(circle at 80% 0%, #d7efe3 0%, rgba(215, 239, 227, 0) 45%),
-        linear-gradient(135deg, #f7f8fb 0%, #eef1f6 100%);
-      min-height: 100vh;
-      padding: 32px 24px 60px;
-    }
-    header {
-      max-width: 1100px;
-      margin: 0 auto 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 24px;
-      flex-wrap: wrap;
-    }
-    .title {
-      font-size: 28px;
-      letter-spacing: -0.5px;
-      margin: 0;
-    }
-    .subtitle {
-      color: var(--muted);
-      margin-top: 6px;
-      font-size: 15px;
-    }
-    .pill {
-      background: rgba(31, 122, 94, 0.12);
-      color: var(--accent);
-      border-radius: 999px;
-      padding: 6px 14px;
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .layout {
-      max-width: 1100px;
-      margin: 0 auto;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 20px;
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--stroke);
-      border-radius: 16px;
-      padding: 18px;
-      box-shadow: var(--shadow);
-      animation: rise 0.5s ease-out;
-    }
-    .card h3 {
-      margin: 0 0 12px;
-      font-size: 18px;
-    }
-    .card p {
-      margin: 0 0 12px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.5;
-    }
-    input[type="file"], input[type="text"] {
-      width: 100%;
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid var(--stroke);
-      font-size: 14px;
-    }
-    button {
-      margin-top: 12px;
-      padding: 10px 16px;
-      border-radius: 999px;
-      border: none;
-      background: linear-gradient(135deg, var(--accent) 0%, #1d5f86 100%);
-      color: white;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.15s ease;
-    }
-    .file-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .file-input {
-      display: none;
-    }
-    .file-button {
-      display: inline-block;
-      padding: 9px 14px;
-      border-radius: 999px;
-      background: linear-gradient(135deg, #27354a 0%, #1f7a5e 100%);
-      color: #fff;
-      font-size: 13px;
-      cursor: pointer;
-      text-decoration: none;
-    }
-    .file-name {
-      font-size: 13px;
-      color: var(--muted);
-      max-width: 160px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    button:hover { transform: translateY(-1px); }
-    .viewer {
-      max-width: 1100px;
-      margin: 28px auto 0;
-      background: var(--card);
-      border-radius: 20px;
-      border: 1px solid var(--stroke);
-      box-shadow: var(--shadow);
-      padding: 18px;
-      animation: fade 0.7s ease-out;
-    }
-    .viewer h3 {
-      margin: 0 0 12px;
-      font-size: 18px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .viewer h3 span {
-      color: var(--accent-2);
-      font-size: 12px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-    .viewer video {
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid #e4e6ea;
-      background: #0f1217;
-    }
-    .video-shell {
-      position: relative;
-      border-radius: 14px;
-      overflow: hidden;
-      background: #0f1217;
-    }
-    .status-chip {
-      position: absolute;
-      left: 16px;
-      top: 16px;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 14px;
-      border-radius: 999px;
-      background: rgba(20, 32, 40, 0.85);
-      color: #f7f8fb;
-      font-size: 13px;
-      letter-spacing: 0.2px;
-      box-shadow: 0 8px 18px rgba(12, 19, 29, 0.35);
-    }
-    .status-chip.good {
-      background: rgba(82, 196, 138, 0.92);
-      color: #0f2a1f;
-    }
-    .status-chip.bad {
-      background: rgba(196, 38, 38, 0.92);
-    }
-    .status-hint {
-      position: absolute;
-      inset: auto 16px 16px auto;
-      padding: 8px 12px;
-      border-radius: 12px;
-      background: rgba(255, 255, 255, 0.9);
-      color: #1b2430;
-      font-size: 12px;
-      box-shadow: 0 10px 18px rgba(12, 19, 29, 0.2);
-    }
-    @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-    @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
-  </style>
-</head>
-<body>
-  <header>
-    <div>
-      <h2 class="title">违规取放监测</h2>
-      <div class="subtitle">《机器视觉与图像处理》课程大作业    by王弘昊</div>
-    </div>
-    <div class="pill">实时分析</div>
-  </header>
-  <section class="layout">
-    <div class="card">
-      <h3>上传视频</h3>
-      <p>选择本地视频，上传到服务器并使用我们训练的模型进行推理。</p>
-      <form action="/upload" method="post" enctype="multipart/form-data">
-        <div class="file-row">
-          <input class="file-input" type="file" id="videoInput" name="video" accept="video/*" required />
-          <label for="videoInput" class="file-button">选择文件</label>
-          <span class="file-name" id="fileName">未选择任何文件</span>
-        </div>
-        <button type="submit">上传并播放</button>
-      </form>
-    </div>
-    <div class="card">
-      <h3>视频流地址</h3>
-      <p>输入推理源地址（RTSP/HTTP/摄像头），并提供可在浏览器播放的地址（HLS/Web）。</p>
-      <form action="/set_stream" method="post">
-        <input type="text" name="stream_url" placeholder="推理源: rtsp://... 或 http://... 或 0" required />
-        <input type="text" name="play_url" placeholder="播放地址: HLS (.m3u8) 或浏览器可播放 URL" />
-        <button type="submit">开始播放</button>
-      </form>
-    </div>
-    <div class="card">
-      <h3>工作方式</h3>
-      <p>我们以固定间隔采样 5 帧，构建 4 张差分图并利用机器视觉算法分类正常/异常。由于采样需要一定时间，所以推理结果可能略微滞后，但不会超过2s。</p>
-      <p>推理结果会叠加显示在视频画面上。</p>
-    </div>
-  </section>
-  <section class="viewer">
-    <h3><span>实时</span> 推理画面</h3>
-    <div class="video-shell">
-      <video id="streamVideo" controls playsinline muted></video>
-      <div class="status-chip" id="statusChip">
-        <span id="statusText">waiting</span>
-      </div>
-      <div class="status-hint" id="videoHint">未设置播放地址（摄像头/RTSP 需提供 HLS/WebRTC）</div>
-    </div>
-  </section>
-  <script>
-    const input = document.getElementById("videoInput");
-    const nameBox = document.getElementById("fileName");
-    const videoEl = document.getElementById("streamVideo");
-    const statusText = document.getElementById("statusText");
-    const statusChip = document.getElementById("statusChip");
-    const videoHint = document.getElementById("videoHint");
-    if (input && nameBox) {
-      input.addEventListener("change", () => {
-        if (input.files && input.files.length > 0) {
-          nameBox.textContent = input.files[0].name;
-        } else {
-          nameBox.textContent = "未选择任何文件";
-        }
-      });
-    }
-    const setVideoSource = (url) => {
-      if (!url || !videoEl) return;
-      if (videoEl.dataset.src === url) return;
-      videoEl.dataset.src = url;
-      videoEl.src = url;
-      videoEl.load();
-      const playPromise = videoEl.play();
-      if (playPromise && typeof playPromise.catch === "function") {
-        playPromise.catch(() => {});
-      }
-      if (videoHint) {
-        videoHint.style.display = "none";
-      }
-    };
-    const updateStatus = (payload) => {
-      if (!payload) return;
-      if (payload.playback_url) {
-        setVideoSource(payload.playback_url);
-      }
-      if (videoHint) {
-        videoHint.style.display = payload.playback_url ? "none" : "block";
-      }
-      const label = payload.label || "idle";
-      const prob = typeof payload.prob === "number" ? payload.prob : 0;
-      if (statusText) {
-        statusText.textContent = `${label} (${prob.toFixed(2)})`;
-      }
-      if (statusChip) {
-        statusChip.classList.toggle("bad", label === "abnormal");
-        statusChip.classList.toggle("good", label === "normal");
-      }
-    };
-    const sendPlayback = () => {
-      if (!videoEl || !videoEl.src) return;
-      const payload = {
-        time: videoEl.currentTime || 0,
-        paused: videoEl.paused,
-      };
-      fetch("/playback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }).catch(() => {});
-    };
-    let playbackTimer = null;
-    const startPlaybackSync = () => {
-      if (playbackTimer) return;
-      playbackTimer = setInterval(sendPlayback, 250);
-    };
-    const stopPlaybackSync = () => {
-      if (!playbackTimer) return;
-      clearInterval(playbackTimer);
-      playbackTimer = null;
-    };
-    if (videoEl) {
-      videoEl.addEventListener("play", () => {
-        startPlaybackSync();
-        sendPlayback();
-      });
-      videoEl.addEventListener("pause", () => {
-        stopPlaybackSync();
-        sendPlayback();
-      });
-      videoEl.addEventListener("seeked", () => {
-        sendPlayback();
-      });
-      videoEl.addEventListener("loadedmetadata", () => {
-        sendPlayback();
-      });
-    }
-    const refreshStatus = () => {
-      fetch("/status")
-        .then((resp) => resp.json())
-        .then((payload) => updateStatus(payload))
-        .catch(() => {});
-    };
-    const connectWs = () => {
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
-      ws.onmessage = (evt) => {
-        try {
-          const payload = JSON.parse(evt.data);
-          updateStatus(payload);
-        } catch (err) {}
-      };
-      ws.onclose = () => {
-        setTimeout(connectWs, 2000);
-      };
-    };
-    refreshStatus();
-    connectWs();
-  </script>
-</body>
-</html>
-"""
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "index.html")
 
 
 class SimpleCNN(nn.Module):
@@ -842,11 +488,14 @@ def make_handler(state, hub, args):
 
         def do_GET(self):
             if self.path == "/" or self.path.startswith("/index"):
-                return self._write_html(HTML_PAGE)
+                with open(TEMPLATE_PATH, "r", encoding="utf-8") as handle:
+                    return self._write_html(handle.read())
             if self.path.startswith("/status"):
                 return self._write_json(state.get_status())
             if self.path.startswith("/ws"):
                 return self._handle_websocket()
+            if self.path.startswith("/static/"):
+                return self._serve_static(self.path[len("/static/") :])
             if self.path.startswith("/uploads/"):
                 return self._serve_upload(self.path[len("/uploads/") :])
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
@@ -933,6 +582,19 @@ def make_handler(state, hub, args):
                 return
             uploads_dir = os.path.abspath(args.uploads_dir)
             path = os.path.join(uploads_dir, safe_name)
+            if not os.path.isfile(path):
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+            self._send_file(path)
+
+        def _serve_static(self, name):
+            decoded = urlparse.unquote(name)
+            safe_name = os.path.basename(decoded)
+            if safe_name != decoded:
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+            static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static"))
+            path = os.path.join(static_dir, safe_name)
             if not os.path.isfile(path):
                 self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
                 return

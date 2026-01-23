@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>视频异常监测</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h2 class="title">违规取放监测</h2>
+      <div class="subtitle">《机器视觉与图像处理》课程大作业    by王弘昊</div>
+    </div>
+    <div class="pill">实时分析</div>
+  </header>
+  <section class="layout">
+    <div class="card">
+      <h3>上传视频</h3>
+      <p>选择本地视频，上传到服务器并使用我们训练的模型进行推理。</p>
+      <form action="/upload" method="post" enctype="multipart/form-data">
+        <div class="file-row">
+          <input class="file-input" type="file" id="videoInput" name="video" accept="video/*" required />
+          <label for="videoInput" class="file-button">选择文件</label>
+          <span class="file-name" id="fileName">未选择任何文件</span>
+        </div>
+        <button type="submit">上传并播放</button>
+      </form>
+    </div>
+    <div class="card">
+      <h3>视频流地址</h3>
+      <p>输入推理源地址（RTSP/HTTP/摄像头），并提供可在浏览器播放的地址（HLS/Web）。</p>
+      <form action="/set_stream" method="post">
+        <input type="text" name="stream_url" placeholder="推理源: rtsp://... 或 http://... 或 0" required />
+        <input type="text" name="play_url" placeholder="播放地址: HLS (.m3u8) 或浏览器可播放 URL" />
+        <button type="submit">开始播放</button>
+      </form>
+    </div>
+    <div class="card">
+      <h3>工作方式</h3>
+      <p>我们以固定间隔采样 5 帧，构建 4 张差分图并利用机器视觉算法分类正常/异常。由于采样需要一定时间，所以推理结果可能略微滞后，但不会超过2s。</p>
+      <p>推理结果会叠加显示在视频画面上。</p>
+    </div>
+  </section>
+  <section class="viewer">
+    <h3><span>实时</span> 推理画面</h3>
+    <div class="video-shell">
+      <video id="streamVideo" controls playsinline muted></video>
+      <div class="status-chip" id="statusChip">
+        <span id="statusText">waiting</span>
+      </div>
+      <div class="status-hint" id="videoHint">未设置播放地址（摄像头/RTSP 需提供 HLS/WebRTC）</div>
+    </div>
+  </section>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
+
