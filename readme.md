@@ -10,7 +10,7 @@
 
 #### 使用说明
 
-我们建议在虚拟环境中开始使用，请从`env.yml`中创建虚拟环境。如果你准备使用我们的数据集，请跳至第4步，如果你准备使用我们训练完成的模型，请跳至第6步。
+我们建议在虚拟环境中开始使用，请从`env.yml`中创建虚拟环境。如果你准备使用我们标注的数据，请从`release`中下载`label.csv`并跳过第2步，如果你准备使用我们训练完成的模型，请跳至第6步。
 
 ##### 1.数据预处理
 
@@ -35,7 +35,7 @@ videos/
 
 `python label.py`
 
-这将启动一个可视化的窗口，允许你进行数据标注工作。
+这将启动一个可视化的窗口，允许你进行数据标注工作。**你也可以从**`release`**中下载**`label.csv`**并跳过这一步，这意味着你将使用我们的标注结果**。
 
 ##### 3.数据集构建
 
@@ -65,7 +65,7 @@ python train_diff_model.py
 
 ##### 6.Web 推理与可视化
 
-使用训练完成的模型启动推理服务（默认端口 8000）：
+使用训练完成的模型启动推理服务：
 
 ```
 python web_infer.py --model final_model.pt --port 8000
@@ -73,8 +73,8 @@ python web_infer.py --model final_model.pt --port 8000
 
 启动后访问 `http://127.0.0.1:8000` 即可上传视频或配置推理源。  
 可选参数：
-- `--uploads-dir` 设置上传目录（默认 `uploads`）
-- `--max-upload-mb` 限制单个上传文件大小（默认 2048MB）
+- `--uploads-dir` 设置上传目录
+- `--max-upload-mb` 限制单个上传文件大小
 
 
 
@@ -103,8 +103,8 @@ deploy/
 ```yaml
 services:
   webinfer:
-    image: ghcr.io/zju-mvopt/mv-infer:latest
-    container_name: mvopt-webinfer
+    image: ghcr.io/udp-worker/mv-infer:latest
+    container_name: safeline
     ports:
       - "8000:8000"
     volumes:
