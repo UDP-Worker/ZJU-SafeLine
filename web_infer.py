@@ -1,27 +1,29 @@
 import argparse
-import base64
-import cgi
-import hashlib
-import json
+import asyncio
+import logging
 import mimetypes
 import os
 import socket
-import struct
 import sys
 import threading
 import time
 from collections import deque
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import asynccontextmanager, suppress
 from urllib import parse as urlparse
 
 import cv2
 import numpy as np
 import torch
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from torch import nn
 
-
-TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "index.html")
+BASE_DIR = os.path.dirname(__file__)
+TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 
 class SimpleCNN(nn.Module):
@@ -171,12 +173,13 @@ def cleanup_uploads(uploads_dir, max_age_minutes, max_total_mb, state):
             stat = os.stat(path)
         except OSError:
             continue
-        files.append((path, stat.st_mtime, stat.st_size))
-        total_size += stat.st_size
+        size = stat.st_size
+        mtime = stat.st_mtime
+        files.append((path, mtime, size))
+        total_size += size
 
     files.sort(key=lambda item: item[1])
-
-    for path, mtime, size in files:
+    for path, mtime, size in files[:]:
         if current_source and os.path.abspath(path) == current_source:
             continue
         if max_age_minutes > 0 and (now - mtime) >= max_age_seconds:
@@ -247,76 +250,65 @@ def parse_args():
     return parser.parse_args()
 
 
-WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-
-def build_ws_frame(payload, opcode=0x1):
-    length = len(payload)
-    if length < 126:
-        header = struct.pack("!BB", 0x80 | opcode, length)
-    elif length < (1 << 16):
-        header = struct.pack("!BBH", 0x80 | opcode, 126, length)
-    else:
-        header = struct.pack("!BBQ", 0x80 | opcode, 127, length)
-    return header + payload
-
-
-def recv_exact(sock, size):
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return data
-
-
-class WebSocketClient:
-    def __init__(self, sock, addr):
-        self.sock = sock
-        self.addr = addr
-        self.lock = threading.Lock()
-
-    def send_frame(self, frame):
-        with self.lock:
-            self.sock.sendall(frame)
-
-
-class WebSocketHub:
+class ConnectionManager:
     def __init__(self):
-        self.lock = threading.Lock()
-        self.clients = set()
+        self.active = set()
 
-    def add(self, client):
-        with self.lock:
-            self.clients.add(client)
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active.add(websocket)
 
-    def remove(self, client):
-        with self.lock:
-            self.clients.discard(client)
+    def disconnect(self, websocket: WebSocket):
+        self.active.discard(websocket)
 
-    def broadcast_json(self, payload):
-        data = json.dumps(payload).encode("utf-8")
-        frame = build_ws_frame(data, opcode=0x1)
-        with self.lock:
-            clients = list(self.clients)
-        for client in clients:
+    async def broadcast(self, payload):
+        to_remove = []
+        for ws in list(self.active):
             try:
-                client.send_frame(frame)
-            except OSError:
-                self.remove(client)
+                await ws.send_json(payload)
+            except Exception:
+                to_remove.append(ws)
+        for ws in to_remove:
+            self.active.discard(ws)
 
-    def send_json(self, client, payload):
-        data = json.dumps(payload).encode("utf-8")
-        frame = build_ws_frame(data, opcode=0x1)
-        client.send_frame(frame)
+
+class Broadcaster:
+    def __init__(self, manager, max_queue=100):
+        self.manager = manager
+        self.queue = asyncio.Queue(maxsize=max_queue)
+        self.loop = None
+
+    def set_loop(self, loop):
+        self.loop = loop
+
+    def publish(self, payload):
+        if not self.loop:
+            return
+
+        def _offer():
+            if self.queue.full():
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                self.queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+        self.loop.call_soon_threadsafe(_offer)
+
+    async def run(self):
+        while True:
+            payload = await self.queue.get()
+            await self.manager.broadcast(payload)
 
 
 class InferenceWorker(threading.Thread):
-    def __init__(self, state, hub, model, device, args):
+    def __init__(self, state, broadcaster, model, device, args):
         super().__init__(daemon=True)
         self.state = state
-        self.hub = hub
+        self.broadcaster = broadcaster
         self.model = model
         self.device = device
         self.args = args
@@ -378,7 +370,7 @@ class InferenceWorker(threading.Thread):
                     cap.release()
                     cap = None
                     self.state.update_result("source unavailable", 0.0)
-                    self.hub.broadcast_json(self.state.get_status())
+                    self.broadcaster.publish(self.state.get_status())
                     time.sleep(1.0)
                     continue
 
@@ -394,7 +386,7 @@ class InferenceWorker(threading.Thread):
                     frames = self._read_window(cap, target_time, sample_interval)
                     if frames is None:
                         self.state.update_result("source ended", 0.0)
-                        self.hub.broadcast_json(self.state.get_status())
+                        self.broadcaster.publish(self.state.get_status())
                         time.sleep(0.2)
                         continue
                     frame_buffer.clear()
@@ -408,7 +400,7 @@ class InferenceWorker(threading.Thread):
                     frame = self._read_frame_at(cap, next_time)
                     if frame is None:
                         self.state.update_result("source ended", 0.0)
-                        self.hub.broadcast_json(self.state.get_status())
+                        self.broadcaster.publish(self.state.get_status())
                         time.sleep(0.2)
                         continue
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -427,7 +419,7 @@ class InferenceWorker(threading.Thread):
                     prob = torch.sigmoid(logits).item()
                 label = "abnormal" if prob >= self.args.threshold else "normal"
                 self.state.update_result(label, prob)
-                self.hub.broadcast_json(self.state.get_status())
+                self.broadcaster.publish(self.state.get_status())
                 continue
 
             now = time.time()
@@ -444,7 +436,7 @@ class InferenceWorker(threading.Thread):
                 cap.release()
                 cap = None
                 self.state.update_result("source ended", 0.0)
-                self.hub.broadcast_json(self.state.get_status())
+                self.broadcaster.publish(self.state.get_status())
                 time.sleep(0.5)
                 continue
 
@@ -465,254 +457,140 @@ class InferenceWorker(threading.Thread):
                 prob = torch.sigmoid(logits).item()
             label = "abnormal" if prob >= self.args.threshold else "normal"
             self.state.update_result(label, prob)
-            self.hub.broadcast_json(self.state.get_status())
+            self.broadcaster.publish(self.state.get_status())
 
 
-def make_handler(state, hub, args):
-    class Handler(BaseHTTPRequestHandler):
-        def _write_html(self, html, status=HTTPStatus.OK):
-            data = html.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+class PlaybackPayload(BaseModel):
+    time: float
+    paused: bool = False
 
-        def _write_json(self, payload, status=HTTPStatus.OK):
-            data = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
 
-        def do_GET(self):
-            if self.path == "/" or self.path.startswith("/index"):
-                with open(TEMPLATE_PATH, "r", encoding="utf-8") as handle:
-                    return self._write_html(handle.read())
-            if self.path.startswith("/status"):
-                return self._write_json(state.get_status())
-            if self.path.startswith("/ws"):
-                return self._handle_websocket()
-            if self.path.startswith("/static/"):
-                return self._serve_static(self.path[len("/static/") :])
-            if self.path.startswith("/uploads/"):
-                return self._serve_upload(self.path[len("/uploads/") :])
-            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+def create_app(args, model, device):
+    state = AppState()
+    manager = ConnectionManager()
+    broadcaster = Broadcaster(manager)
+    uploads_dir = os.path.abspath(args.uploads_dir)
+    os.makedirs(uploads_dir, exist_ok=True)
 
-        def do_POST(self):
-            if self.path == "/upload":
-                return self._handle_upload()
-            if self.path == "/set_stream":
-                return self._handle_stream()
-            if self.path == "/playback":
-                return self._handle_playback()
-            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+    @asynccontextmanager
+    async def lifespan(app):
+        broadcaster.set_loop(asyncio.get_running_loop())
+        app.state.broadcast_task = asyncio.create_task(broadcaster.run())
+        if args.cleanup_minutes > 0 or args.cleanup_max_mb > 0:
+            cleanup_thread = threading.Thread(
+                target=cleanup_loop,
+                args=(
+                    uploads_dir,
+                    args.cleanup_minutes,
+                    args.cleanup_max_mb,
+                    max(30, args.cleanup_interval),
+                    state,
+                ),
+                daemon=True,
+            )
+            cleanup_thread.start()
+            app.state.cleanup_thread = cleanup_thread
+        worker = InferenceWorker(state, broadcaster, model, device, args)
+        worker.start()
+        app.state.worker = worker
+        yield
+        task = getattr(app.state, "broadcast_task", None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
-        def _handle_upload(self):
-            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
-            if "video" not in form:
-                return self._write_html("No file uploaded", status=HTTPStatus.BAD_REQUEST)
-            file_item = form["video"]
-            if not file_item.filename:
-                return self._write_html("Empty filename", status=HTTPStatus.BAD_REQUEST)
-            uploads_dir = os.path.abspath(args.uploads_dir)
-            os.makedirs(uploads_dir, exist_ok=True)
-            safe_name = os.path.basename(file_item.filename)
-            out_path = os.path.join(uploads_dir, safe_name)
-            with open(out_path, "wb") as handle:
-                handle.write(file_item.file.read())
-            playback_url = f"/uploads/{urlparse.quote(safe_name)}"
-            state.set_source(out_path, safe_name, playback_url=playback_url)
-            hub.broadcast_json(state.get_status())
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.end_headers()
+    app = FastAPI(lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-        def _handle_stream(self):
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            params = urlparse.parse_qs(body, keep_blank_values=True)
-            stream_url = params.get("stream_url", [""])[0].strip()
-            play_url = params.get("play_url", [""])[0].strip()
-            if not stream_url:
-                return self._write_html("Empty stream url", status=HTTPStatus.BAD_REQUEST)
-            if stream_url.isdigit():
-                source = int(stream_url)
-            else:
-                source = stream_url
-            playback_url = play_url
-            if not playback_url and stream_url.startswith(("http://", "https://")):
-                playback_url = stream_url
-            state.set_source(source, str(stream_url), playback_url=playback_url)
-            hub.broadcast_json(state.get_status())
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.end_headers()
+    @app.get("/", response_class=HTMLResponse)
+    @app.get("/index", response_class=HTMLResponse)
+    @app.get("/index.html", response_class=HTMLResponse)
+    async def index():
+        with open(TEMPLATE_PATH, "r", encoding="utf-8") as handle:
+            return HTMLResponse(handle.read())
 
-        def _handle_playback(self):
-            length = int(self.headers.get("Content-Length", 0))
-            if length <= 0:
-                self.send_error(HTTPStatus.BAD_REQUEST, "Missing body")
-                return
-            body = self.rfile.read(length).decode("utf-8")
-            try:
-                payload = json.loads(body)
-            except json.JSONDecodeError:
-                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
-                return
-            if "time" not in payload:
-                self.send_error(HTTPStatus.BAD_REQUEST, "Missing time")
-                return
-            try:
-                time_value = float(payload["time"])
-            except (TypeError, ValueError):
-                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid time")
-                return
-            paused = bool(payload.get("paused", False))
-            state.update_playback(time_value, paused)
-            self.send_response(HTTPStatus.NO_CONTENT)
-            self.end_headers()
+    @app.get("/status")
+    async def status():
+        return state.get_status()
 
-        def _serve_upload(self, name):
-            decoded = urlparse.unquote(name)
-            safe_name = os.path.basename(decoded)
-            if safe_name != decoded:
-                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
-                return
-            uploads_dir = os.path.abspath(args.uploads_dir)
-            path = os.path.join(uploads_dir, safe_name)
-            if not os.path.isfile(path):
-                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
-                return
-            self._send_file(path)
+    @app.get("/uploads/{name}")
+    async def uploads(name: str):
+        decoded = urlparse.unquote(name)
+        safe_name = os.path.basename(decoded)
+        if safe_name != decoded:
+            raise HTTPException(status_code=404, detail="Not Found")
+        path = os.path.join(uploads_dir, safe_name)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="Not Found")
+        media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return FileResponse(path, media_type=media_type)
 
-        def _serve_static(self, name):
-            decoded = urlparse.unquote(name)
-            safe_name = os.path.basename(decoded)
-            if safe_name != decoded:
-                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
-                return
-            static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static"))
-            path = os.path.join(static_dir, safe_name)
-            if not os.path.isfile(path):
-                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
-                return
-            self._send_file(path)
-
-        def _send_file(self, path):
-            size = os.path.getsize(path)
-            content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-            range_header = self.headers.get("Range")
-            start = 0
-            end = size - 1
-            status = HTTPStatus.OK
-
-            if range_header and range_header.startswith("bytes="):
-                try:
-                    range_spec = range_header.replace("bytes=", "", 1).strip()
-                    if "," not in range_spec:
-                        start_text, end_text = range_spec.split("-", 1)
-                        if start_text:
-                            start = int(start_text)
-                            if end_text:
-                                end = int(end_text)
-                        else:
-                            suffix = int(end_text)
-                            start = max(0, size - suffix)
-                        end = min(end, size - 1)
-                        if start <= end:
-                            status = HTTPStatus.PARTIAL_CONTENT
-                        else:
-                            self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                            return
-                except ValueError:
-                    self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                    return
-
-            length = end - start + 1
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Accept-Ranges", "bytes")
-            if status == HTTPStatus.PARTIAL_CONTENT:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.send_header("Content-Length", str(length))
-            self.end_headers()
-
-            with open(path, "rb") as handle:
-                if start:
-                    handle.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = handle.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    try:
-                        self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
-                    remaining -= len(chunk)
-
-        def _handle_websocket(self):
-            key = self.headers.get("Sec-WebSocket-Key")
-            if not key:
-                self.send_error(HTTPStatus.BAD_REQUEST, "Missing WebSocket key")
-                return
-            accept_src = (key + WS_GUID).encode("utf-8")
-            accept = base64.b64encode(hashlib.sha1(accept_src).digest()).decode("ascii")
-            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
-            self.send_header("Upgrade", "websocket")
-            self.send_header("Connection", "Upgrade")
-            self.send_header("Sec-WebSocket-Accept", accept)
-            self.end_headers()
-
-            client = WebSocketClient(self.request, self.client_address)
-            hub.add(client)
-            try:
-                hub.send_json(client, state.get_status())
-                self._ws_read_loop(client)
-            finally:
-                hub.remove(client)
-
-        def _ws_read_loop(self, client):
-            sock = client.sock
+    @app.post("/upload")
+    async def upload(video: UploadFile = File(...)):
+        if not video.filename:
+            raise HTTPException(status_code=400, detail="Empty filename")
+        safe_name = os.path.basename(video.filename)
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="Empty filename")
+        out_path = os.path.join(uploads_dir, safe_name)
+        with open(out_path, "wb") as handle:
             while True:
-                header = recv_exact(sock, 2)
-                if header is None:
+                chunk = await video.read(1024 * 1024)
+                if not chunk:
                     break
-                b1, b2 = header
-                opcode = b1 & 0x0F
-                masked = b2 & 0x80
-                length = b2 & 0x7F
-                if length == 126:
-                    ext = recv_exact(sock, 2)
-                    if ext is None:
-                        break
-                    length = struct.unpack("!H", ext)[0]
-                elif length == 127:
-                    ext = recv_exact(sock, 8)
-                    if ext is None:
-                        break
-                    length = struct.unpack("!Q", ext)[0]
-                mask = recv_exact(sock, 4) if masked else None
-                payload = recv_exact(sock, length) if length else b""
-                if payload is None:
-                    break
-                if mask:
-                    payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-                if opcode == 0x8:
-                    break
-                if opcode == 0x9:
-                    pong = build_ws_frame(payload, opcode=0xA)
-                    try:
-                        client.send_frame(pong)
-                    except OSError:
-                        break
+                handle.write(chunk)
+        await video.close()
+        playback_url = f"/uploads/{urlparse.quote(safe_name)}"
+        state.set_source(out_path, safe_name, playback_url=playback_url)
+        broadcaster.publish(state.get_status())
+        return RedirectResponse(url="/", status_code=303)
 
-        def log_message(self, format, *args):
-            return
+    @app.post("/set_stream")
+    async def set_stream(stream_url: str = Form(...), play_url: str = Form("")):
+        stream_url = stream_url.strip()
+        play_url = play_url.strip()
+        if not stream_url:
+            raise HTTPException(status_code=400, detail="Empty stream url")
+        if stream_url.isdigit():
+            source = int(stream_url)
+        else:
+            source = stream_url
+        playback_url = play_url
+        if not playback_url and stream_url.startswith(("http://", "https://")):
+            playback_url = stream_url
+        state.set_source(source, str(stream_url), playback_url=playback_url)
+        broadcaster.publish(state.get_status())
+        return RedirectResponse(url="/", status_code=303)
 
-    return Handler
+    @app.post("/playback")
+    async def playback(payload: PlaybackPayload):
+        state.update_playback(payload.time, payload.paused)
+        return Response(status_code=204)
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await manager.connect(websocket)
+        try:
+            await websocket.send_json(state.get_status())
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            manager.disconnect(websocket)
+        except Exception:
+            manager.disconnect(websocket)
+            raise
+
+    return app
+
+
+class PlaybackAccessFilter(logging.Filter):
+    def filter(self, record):
+        return "/playback" not in record.getMessage()
+
+
+def configure_access_log():
+    logging.getLogger("uvicorn.access").addFilter(PlaybackAccessFilter())
 
 
 def main():
@@ -731,27 +609,8 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.model, device)
-    state = AppState()
-    hub = WebSocketHub()
-    uploads_dir = os.path.abspath(args.uploads_dir)
-    os.makedirs(uploads_dir, exist_ok=True)
-    if args.cleanup_minutes > 0 or args.cleanup_max_mb > 0:
-        cleanup_thread = threading.Thread(
-            target=cleanup_loop,
-            args=(
-                uploads_dir,
-                args.cleanup_minutes,
-                args.cleanup_max_mb,
-                max(30, args.cleanup_interval),
-                state,
-            ),
-            daemon=True,
-        )
-        cleanup_thread.start()
-    worker = InferenceWorker(state, hub, model, device, args)
-    worker.start()
-    handler = make_handler(state, hub, args)
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
+    app = create_app(args, model, device)
+    configure_access_log()
     print(f"inference device: {device}")
     print(f"local: http://127.0.0.1:{args.port}")
     lan_ip = None
@@ -767,7 +626,7 @@ def main():
             lan_ip = None
     if lan_ip and lan_ip != "127.0.0.1":
         print(f"lan: http://{lan_ip}:{args.port}")
-    server.serve_forever()
+    uvicorn.run(app, host="0.0.0.0", port=args.port, workers=1)
     return 0
 
 
